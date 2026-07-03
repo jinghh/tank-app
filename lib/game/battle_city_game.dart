@@ -272,10 +272,11 @@ class _BattleCityGameState extends State<BattleCityGame>
   }
 
   /// 影响 HUD/覆盖层显示内容的离散状态指纹；逐帧比对，不变则跳过 widget 重建。
+  /// 用 Object.hash 位置参数(无 list 分配)，避免每帧在热路径上产生小对象。
   int _hudSig() {
     final p0 = players.isNotEmpty ? players[0].bulletLevel : 0;
     final p1 = players.length > 1 ? players[1].bulletLevel : 0;
-    return Object.hashAll([
+    return Object.hash(
       phase.index,
       score,
       lives,
@@ -286,7 +287,7 @@ class _BattleCityGameState extends State<BattleCityGame>
       _twoPlayer ? 1 : 0,
       p0,
       p1,
-    ]);
+    );
   }
 
   bool _hudChanged() {
