@@ -6,6 +6,7 @@
 
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 
 import 'constants.dart';
@@ -105,17 +106,38 @@ Color _tankBodyColor(Tank t, bool flash) {
   }
 }
 
-// ============================ 静态地形层 ============================
-class TerrainPainter extends CustomPainter {
-  final List<List<Terrain>> grid;
-  final bool baseAlive;
-  final int terrainVersion;
+/// 共享场景视图：渲染层直接读取其"可变字段"获取实时数据，
+/// 从而让 CustomPaint 可由 Listenable 驱动按帧重绘，而不必每帧重建 widget 树。
+class SceneView {
+  List<List<Terrain>> grid;
+  final List<Tank> players;
+  final List<Tank> enemies;
+  final List<Bullet> bullets;
+  final List<Explosion> explosions;
+  final List<PowerUp> powerups;
+  // 预计算的树丛矩形（树丛不可破坏，仅随关卡变化），避免每帧扫描整张 26x26 网格。
+  final List<Rect> treeRects = [];
+  double time = 0;
+  bool freezeActive = false;
+  bool baseAlive = true;
 
-  TerrainPainter({
-    required this.grid,
-    required this.baseAlive,
-    required this.terrainVersion,
-  });
+  SceneView(
+    this.grid,
+    this.players,
+    this.enemies,
+    this.bullets,
+    this.explosions,
+    this.powerups,
+  );
+}
+
+// ============================ 静态地形层 ============================
+// 由外部 ChangeNotifier（_terrainRepaint）驱动重绘：地形只在砖墙被毁/基地装甲切换时变化，
+// 无需每帧重绘；shouldRepaint 返回 false，重绘完全由 repaint Listenable 触发。
+class TerrainPainter extends CustomPainter {
+  final SceneView scene;
+
+  TerrainPainter(this.scene, Listenable repaint) : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -124,6 +146,7 @@ class TerrainPainter extends CustomPainter {
     canvas.scale(scale);
     canvas.drawRect(Rect.fromLTWH(0, 0, kBattle, kBattle), _pBg);
 
+    final grid = scene.grid;
     for (int y = 0; y < kCells; y++) {
       for (int x = 0; x < kCells; x++) {
         final r = Rect.fromLTWH(x * kCell, y * kCell, kCell, kCell);
@@ -146,36 +169,21 @@ class TerrainPainter extends CustomPainter {
         }
       }
     }
-    _drawBase(canvas, baseAlive);
+    _drawBase(canvas, scene.baseAlive);
     canvas.restore();
   }
 
   @override
-  bool shouldRepaint(covariant TerrainPainter old) =>
-      old.terrainVersion != terrainVersion;
+  bool shouldRepaint(covariant TerrainPainter old) => false;
 }
 
 // ============================ 动态实体层 ============================
+// 由外部 ChangeNotifier（_frameRepaint）每帧驱动重绘；shouldRepaint 返回 false，
+// 重绘完全由 repaint Listenable 触发，与 widget 树重建解耦。
 class EntitiesPainter extends CustomPainter {
-  final List<List<Terrain>> grid;
-  final List<Tank> players;
-  final List<Tank> enemies;
-  final List<Bullet> bullets;
-  final List<Explosion> explosions;
-  final List<PowerUp> powerups;
-  final double time;
-  final bool freezeActive;
+  final SceneView scene;
 
-  EntitiesPainter({
-    required this.grid,
-    required this.players,
-    required this.enemies,
-    required this.bullets,
-    required this.explosions,
-    required this.powerups,
-    required this.time,
-    required this.freezeActive,
-  });
+  EntitiesPainter(this.scene, Listenable repaint) : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -183,33 +191,32 @@ class EntitiesPainter extends CustomPainter {
     canvas.save();
     canvas.scale(scale);
 
+    final time = scene.time;
+    final freezeActive = scene.freezeActive;
+
     // 敌方坦克 / 子弹 / 爆炸
-    for (final e in enemies) {
+    for (final e in scene.enemies) {
       _drawTank(canvas, e, time, freezeActive);
     }
-    for (final b in bullets) {
+    for (final b in scene.bullets) {
       _drawBullet(canvas, b);
     }
-    for (final ex in explosions) {
+    for (final ex in scene.explosions) {
       _drawExplosion(canvas, ex);
     }
 
-    // 树丛覆盖（敌方坦克可借草丛隐身）
-    for (int y = 0; y < kCells; y++) {
-      for (int x = 0; x < kCells; x++) {
-        if (grid[y][x] == Terrain.trees) {
-          _drawTrees(canvas, Rect.fromLTWH(x * kCell, y * kCell, kCell, kCell));
-        }
-      }
+    // 树丛覆盖（敌方坦克可借草丛隐身）：使用预计算矩形，避免每帧扫描 676 格
+    for (final r in scene.treeRects) {
+      _drawTrees(canvas, r);
     }
 
     // 玩家坦克始终绘制于草丛之上（永远看得到自己）
-    for (final p in players) {
+    for (final p in scene.players) {
       _drawTank(canvas, p, time, freezeActive);
     }
 
     // 道具
-    for (final pu in powerups) {
+    for (final pu in scene.powerups) {
       _drawPowerUp(canvas, pu, time);
     }
 
@@ -217,7 +224,7 @@ class EntitiesPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
 // ============================ 绘制子程序 ============================

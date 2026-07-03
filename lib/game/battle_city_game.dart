@@ -39,7 +39,6 @@ class _BattleCityGameState extends State<BattleCityGame>
   int score = 0;
   int lives = kStartLives;
   bool baseAlive = true;
-  int _terrainVersion = 0; // 地形变化版本号，驱动静态层按需重绘
 
   late List<EnemyKind> _queue;
   late Set<int> _bonusSet;
@@ -58,6 +57,12 @@ class _BattleCityGameState extends State<BattleCityGame>
   final Random _rng = Random();
   final FocusNode _focus = FocusNode();
   final SoundService _sound = SoundService();
+
+  // 渲染解耦：画布由下列 Listenable 驱动按帧/按需重绘，widget 树不再每帧重建。
+  late final SceneView _scene;
+  final ValueNotifier<int> _frameRepaint = ValueNotifier<int>(0); // 实体层：游戏中每帧
+  final ValueNotifier<int> _terrainRepaint = ValueNotifier<int>(0); // 地形层：仅在砖墙/装甲变化时
+  int _lastHudSig = 0; // 上一次影响 HUD/覆盖层的离散状态指纹
 
   // 输入：P1 / P2 各自方向与开火
   Dir? _dir1, _dir2;
@@ -80,6 +85,15 @@ class _BattleCityGameState extends State<BattleCityGame>
       kCell * 2,
     );
     baseArmorCells = _computeArmorCells();
+    // 先建场景视图（持有各实体列表引用），loadLevel 会回填 grid 与树丛矩形
+    _scene = SceneView(
+      const [],
+      players,
+      enemies,
+      bullets,
+      explosions,
+      powerups,
+    );
     loadLevel(0, twoPlayer: false); // 菜单背景板
     _ticker = createTicker(_onTick);
     _ticker.start();
@@ -92,6 +106,8 @@ class _BattleCityGameState extends State<BattleCityGame>
     _ticker.dispose();
     _focus.dispose();
     _sound.dispose();
+    _frameRepaint.dispose();
+    _terrainRepaint.dispose();
     WakelockPlus.disable();
     super.dispose();
   }
@@ -114,6 +130,9 @@ class _BattleCityGameState extends State<BattleCityGame>
     level = n;
     final map = kLevels[n % kLevels.length];
     grid = parseTerrain(map);
+    _scene.grid = grid;
+    _scene.baseAlive = true;
+    _rebuildTreeRects(); // 树丛仅随关卡变化，预计算一次
     enemies.clear();
     bullets.clear();
     explosions.clear();
@@ -122,7 +141,7 @@ class _BattleCityGameState extends State<BattleCityGame>
     _freezeTime = 0;
     _shovelTime = 0;
     baseAlive = true;
-    _terrainVersion++;
+    _bumpTerrain();
 
     _clearArea(kPlayerSpawnCol, kPlayerSpawnRow);
     if (_twoPlayer) _clearArea(kPlayer2SpawnCol, kPlayerSpawnRow);
@@ -166,7 +185,25 @@ class _BattleCityGameState extends State<BattleCityGame>
         grid[c.y][c.x] = steel ? Terrain.steel : Terrain.brick;
       }
     }
-    _terrainVersion++;
+    _bumpTerrain();
+  }
+
+  /// 地形变化：通知静态地形层按需重绘（不触发 widget 重建）。
+  void _bumpTerrain() {
+    _terrainRepaint.value = _terrainRepaint.value + 1;
+  }
+
+  /// 预计算本关全部树丛格的世界矩形，供实体层直接遍历绘制。
+  void _rebuildTreeRects() {
+    _scene.treeRects.clear();
+    for (int y = 0; y < kCells; y++) {
+      for (int x = 0; x < kCells; x++) {
+        if (grid[y][x] == Terrain.trees) {
+          _scene.treeRects
+              .add(Rect.fromLTWH(x * kCell, y * kCell, kCell, kCell));
+        }
+      }
+    }
   }
 
   void startGame({required bool twoPlayer}) {
@@ -203,10 +240,60 @@ class _BattleCityGameState extends State<BattleCityGame>
       case Phase.victory:
         break;
     }
-    // 仅在需要动画的阶段触发重建，菜单/暂停时静止（省电、减负）
-    if (mounted && phase != Phase.start && phase != Phase.paused) {
+    if (!mounted) return;
+
+    // 阶段切换后仍让残留爆炸播完（如基地被毁 → GameOver）；暂停/菜单时冻结。
+    final advanceFx = phase == Phase.gameOver ||
+        phase == Phase.victory ||
+        phase == Phase.levelClear;
+    if (advanceFx) {
+      for (final ex in explosions) {
+        ex.t += dt;
+      }
+      explosions.removeWhere((e) => e.done);
+    }
+
+    // 同步本帧实时数据，供画布直接读取（不经过 widget 重建）
+    _scene.time = _time;
+    _scene.freezeActive = _freezeTime > 0;
+
+    // 实体层：游戏中每帧重绘；结算/胜负阶段若有残留爆炸也重绘以播完动画。
+    if (phase == Phase.playing || (advanceFx && explosions.isNotEmpty)) {
+      _frameRepaint.value = _frameRepaint.value + 1;
+    }
+
+    // 结算/胜利界面含逐帧动画（数字滚动、回弹、闪烁火花），需重建覆盖层；
+    // GameOver 为静态界面，仅在出现或离散状态变化时重建。
+    final animOverlay =
+        phase == Phase.levelClear || phase == Phase.victory;
+    if (animOverlay || _hudChanged()) {
       setState(() {});
     }
+  }
+
+  /// 影响 HUD/覆盖层显示内容的离散状态指纹；逐帧比对，不变则跳过 widget 重建。
+  int _hudSig() {
+    final p0 = players.isNotEmpty ? players[0].bulletLevel : 0;
+    final p1 = players.length > 1 ? players[1].bulletLevel : 0;
+    return Object.hashAll([
+      phase.index,
+      score,
+      lives,
+      level,
+      _killed,
+      _sound.muted ? 1 : 0,
+      baseAlive ? 1 : 0,
+      _twoPlayer ? 1 : 0,
+      p0,
+      p1,
+    ]);
+  }
+
+  bool _hudChanged() {
+    final s = _hudSig();
+    if (s == _lastHudSig) return false;
+    _lastHudSig = s;
+    return true;
   }
 
   void _advanceLevel() {
@@ -511,7 +598,8 @@ class _BattleCityGameState extends State<BattleCityGame>
       }
       if (baseAlive && r.overlaps(baseRect)) {
         baseAlive = false;
-        _terrainVersion++;
+        _scene.baseAlive = false; // 同步给地形层，确保基地被毁画面即时更新
+        _bumpTerrain();
         b.dead = true;
         explosions.add(
             Explosion(baseRect.center, life: 0.5, size: kTank * 2, big: true));
@@ -532,12 +620,12 @@ class _BattleCityGameState extends State<BattleCityGame>
           final t = grid[y][x];
           if (t == Terrain.brick) {
             grid[y][x] = Terrain.empty;
-            _terrainVersion++;
+            _bumpTerrain();
             hitWall = true;
           } else if (t == Terrain.steel) {
             if (b.power >= 3) {
               grid[y][x] = Terrain.empty;
-              _terrainVersion++;
+              _bumpTerrain();
             }
             hitWall = true;
             hitSteel = true;
@@ -816,25 +904,12 @@ class _BattleCityGameState extends State<BattleCityGame>
                             RepaintBoundary(
                               child: CustomPaint(
                                 size: Size.square(battle),
-                                painter: TerrainPainter(
-                                  grid: grid,
-                                  baseAlive: baseAlive,
-                                  terrainVersion: _terrainVersion,
-                                ),
+                                painter: TerrainPainter(_scene, _terrainRepaint),
                               ),
                             ),
                             CustomPaint(
                               size: Size.square(battle),
-                              painter: EntitiesPainter(
-                                grid: grid,
-                                players: players,
-                                enemies: enemies,
-                                bullets: bullets,
-                                explosions: explosions,
-                                powerups: powerups,
-                                time: _time,
-                                freezeActive: _freezeTime > 0,
-                              ),
+                              painter: EntitiesPainter(_scene, _frameRepaint),
                             ),
                           ],
                         ),
@@ -864,7 +939,7 @@ class _BattleCityGameState extends State<BattleCityGame>
           top: 56,
           width: w * 0.5,
           bottom: h * 0.5,
-          child: _Joystick(onDir: (d) => setState(() => _dir1 = d)),
+          child: _Joystick(onDir: (d) => _dir1 = d),
         ),
         Positioned(left: 14, bottom: 18, child: _buildFireButton(0)),
         Positioned(
@@ -872,7 +947,7 @@ class _BattleCityGameState extends State<BattleCityGame>
           top: h * 0.5,
           width: w * 0.5,
           bottom: 0,
-          child: _Joystick(onDir: (d) => setState(() => _dir2 = d)),
+          child: _Joystick(onDir: (d) => _dir2 = d),
         ),
         Positioned(right: 14, top: 60, child: _buildFireButton(1)),
       ];
@@ -883,7 +958,7 @@ class _BattleCityGameState extends State<BattleCityGame>
         top: 56,
         width: w * 0.56,
         bottom: 0,
-        child: _Joystick(onDir: (d) => setState(() => _dir1 = d)),
+        child: _Joystick(onDir: (d) => _dir1 = d),
       ),
       Positioned(right: 22, bottom: 28, child: _buildFireButton(0)),
     ];
